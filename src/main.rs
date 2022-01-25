@@ -1,13 +1,19 @@
-
-use log::{info, trace, warn, debug, error};
-use env_logger;
+use std::env;
+use std::fs::File;
+use std::io::Write;
 use hidapi::HidApi;
 
+const CODE_HUM : u8 = 0x41;
 const CODE_TAMB : u8 = 0x42; /* Ambient Temperature */
 const CODE_CNTR : u8 = 0x50; /* Relative Concentration of CO2 */
 
+
 fn decode_temperature(w: u16) -> f64 {
     return w as f64 * 0.0625 - 273.15;
+}
+
+fn decode_humidity(w: u16) -> f64 {
+    return w as f64 / 100.0;
 }
 
 //fn dump(raw: &[u8; 8]) {
@@ -20,72 +26,44 @@ fn decode_temperature(w: u16) -> f64 {
 
 fn main() {
 
-    env_logger::init();
+    // Create a temporary file.
+    let temp_directory = env::temp_dir();
+    let temp_file = temp_directory.join("tfaco2");
+
+    // Open a file in write-only (ignoring errors).
+    // This creates the file if it does not exist (and empty the file if it exists).
+    let mut file = File::create(temp_file).expect("could not create file");
+
+
 
     match HidApi::new() {
         Ok(api) => {
-            let device = api.open(0x04d9, 0xa052).unwrap();
+            let device = api.open(0x04d9, 0xa052).expect("Could not open USB device");
             let magic_table : [u8; 8] = [0; 8];
-            let result = device.send_feature_report(&magic_table);
+            device.send_feature_report(&magic_table).expect("Could not send feature report");
 
             loop {
                 let mut buf : [u8; 8] = [0; 8];
-                let result = device.read_timeout(&mut buf, 5000);
-
-                /* Decode */
-                buf.swap(0, 2);
-                buf.swap(1, 4);
-                buf.swap(3, 7);
-                buf.swap(5, 6);
-
-                for i in 0..8 {
-                    buf[i] ^= magic_table[i];
-                }
-
-                let mut result : [u8; 8] = [0; 8];
-                let tmp : u8 = buf[7] << 5;
-                result[7] = (buf[6] << 5) | (buf[7] >> 3);
-                result[6] = (buf[5] << 5) | (buf[6] >> 3);
-                result[5] = (buf[4] << 5) | (buf[5] >> 3);
-                result[4] = (buf[3] << 5) | (buf[4] >> 3);
-                result[3] = (buf[2] << 5) | (buf[3] >> 3);
-                result[2] = (buf[1] << 5) | (buf[2] >> 3);
-                result[1] = (buf[0] << 5) | (buf[1] >> 3);
-                result[0] = tmp | (buf[0] >> 3);
-
-                let magic_word : [u8; 8] = [
-                    'H' as u8,
-                    't' as u8,
-                    'e' as u8,
-                    'm' as u8,
-                    'p' as u8,
-                    '9' as u8,
-                    '9' as u8,
-                    'e' as u8,
-                ];
-                for i in 0..8 {
-                    let mask : u8 = (magic_word[i] << 4) | (magic_word[i] >> 4);
-                    result[i] = result[i].wrapping_sub(mask);
-                }
+                device.read_timeout(&mut buf, 5000).expect("error reading usb");
 
                 /* Check error message */
-                if result[4] != 0x0d {
-                    warn!("Unexpected data from device (data[4] = {:02x}, want 0x0d)", result[4]);
+                if buf[4] != 0x0d {
+                    println!("Unexpected data from device (data[4] = {:02x}, want 0x0d)", buf[4]);
                     continue;
                 }
 
                 /* Checksum */
-                let r0 : u8 = result[0];
-                let r1 : u8 = result[1];
-                let r2 : u8 = result[2];
-                let r3 : u8 = result[3];
+                let r0 : u8 = buf[0];
+                let r1 : u8 = buf[1];
+                let r2 : u8 = buf[2];
+                let r3 : u8 = buf[3];
                 let checksum = 0u8
                     .wrapping_add(r0)
                     .wrapping_add(r1)
                     .wrapping_add(r2);
 
                 if checksum != r3 {
-                    warn!("checksum error (0x{:02x}, await 0x{:02x})\n", checksum, r3);
+                    println!("checksum error (0x{:02x}, await 0x{:02x})\n", checksum, r3);
                     continue;
                 }
 
@@ -93,29 +71,36 @@ fn main() {
 //                dump(&result);
 
                 /* Decode result */
-                let w : u16 = ((result[1] as u16) << 8) + result[2] as u16;
+                let w : u16 = ((buf[1] as u16) << 8) + buf[2] as u16;
                 match r0 {
                     CODE_TAMB => {
                         let t = decode_temperature(w);
-                        info!("Ambient Temperature is {}", t);
+                        if writeln!(&mut file, "{{\"temp\": {t} }}").is_err() {
+                            println!("error writing file");
+                            continue
+                        }
+                    },
+                    CODE_HUM => {
+                        let t = decode_humidity(w);
+                        if writeln!(&mut file, "{{\"hum\": {t} }}").is_err() {
+                            println!("error writing file");
+                            continue
+                        }
                     },
                     CODE_CNTR => {
-                        if w > 3000 {
-                            // Avoid reading spurious (uninitialized?) data
-                            warn!("Reading spurious data. Please wait.");
+                        if writeln!(&mut file, "{{\"co2\": {w} }}").is_err() {
+                            println!("error writing file");
+                            continue
                         }
-                        info!("Relative Concentration of CO2 is {}", w);
                     },
-                    _ => {
-                        trace!("Unknown code {:02x} value {:?}", r0, w);
-                    }
+                    _ => { }
                 }
 
             }
 
         },
         Err(e) => {
-            error!("Error: {}", e);
+            println!("Error: {}", e);
         },
     }
 
