@@ -1,0 +1,6 @@
+[Unit]
+Description=Script to do stuff with the TFA CO2 monitor
+
+[Service]
+Type=simple
+ExecStart=/home/pepijn/.cargo/bin/rs-co2mon
